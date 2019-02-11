@@ -8,9 +8,9 @@ flags = tf.flags
 FLAGS = flags.FLAGS
 
 flags.DEFINE_integer('batch_size', 1, '')
-flags.DEFINE_string("logs_dir", "train_logs/5_my_contextual_attention-soft_attention_google", "")
+flags.DEFINE_string("logs_dir", "train_logs/9_256_my_contextual_attention", "")
 flags.DEFINE_string("start_checkpoint", None, "")
-flags.DEFINE_integer("log_steps_n", 5000, "")  # 250
+flags.DEFINE_integer("log_steps_n", 1, "")  # 250
 
 
 def main(argv):

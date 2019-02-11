@@ -9,15 +9,15 @@ from tqdm import tqdm
 import math
 
 FLAGS = tf.flags.FLAGS
-tf.flags.DEFINE_string('masks_path', 'data/masks/images', '')
+tf.flags.DEFINE_string('masks_path', 'data/masks', '')
 # maxVertex, maxLength, maxBrushWidth, maxAngle
 tf.flags.DEFINE_integer('max_vertex', 6, '')
 tf.flags.DEFINE_integer('max_length', 200, '')
 tf.flags.DEFINE_integer('max_brush_width', 40, '')
 tf.flags.DEFINE_float('max_angle', math.pi, '')
-n_masks_train = 200000
-n_masks_eval = 15000
-n_masks_test = 15000
+n_masks_train = 200
+n_masks_eval = 100
+n_masks_test = 100
 
 image_size = tuple(data_reader.image_size)
 
@@ -77,7 +77,7 @@ def generate_masks(count, dst_dir):
 
 generate_masks(n_masks_train, os.path.join(FLAGS.masks_path, 'train'))
 generate_masks(n_masks_eval, os.path.join(FLAGS.masks_path, 'eval'))
-generate_masks(n_masks_test, os.path.join(FLAGS.masks_path, 'test'))
+# generate_masks(n_masks_test, os.path.join(FLAGS.masks_path, 'test'))
 
 
 # My old method

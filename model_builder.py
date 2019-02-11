@@ -3,6 +3,8 @@ import data_reader
 from conv2d_spectral_norm import conv2d_spectral_norm
 from coord_conv import AddCoords
 
+edges_discriminator_name = 'edges_discriminator'
+images_discriminator_name = 'image_discriminator'
 
 def float2int(float_image):
     return tf.cast(tf.clip_by_value((float_image + 1) * 127.0, 0, 255), dtype=tf.uint8)
@@ -90,7 +92,7 @@ def model_fn(features, labels, mode, params):
     mask = features['mask']
     edges = features['edges']
 
-    i_out, i_coarse = build_generator(params, i_in, mask, edges, mode)
+    i_out, i_edges = build_generator(params, i_in, mask, edges, mode)
 
     if mode == tf.estimator.ModeKeys.PREDICT:
         export_outputs = {'predict_output': tf.estimator.export.PredictOutput({"i_out": i_out})}
@@ -100,31 +102,43 @@ def model_fn(features, labels, mode, params):
     # Compute loss.
     i_gt = features['i_gt']
 
-    coarse_l1_loss = tf.reduce_mean(tf.abs(i_coarse - i_gt))
-    refined_l1_loss = tf.reduce_mean(tf.abs(i_out - i_gt))
+    edges_l1_loss = tf.reduce_mean(tf.abs(i_edges - i_gt))
+    images_l1_loss = tf.reduce_mean(tf.abs(i_out - i_gt))
+
+    discriminator_edges_data = build_discriminator(edges_discriminator_name, edges)
+    discriminator_edges_z = build_discriminator(edges_discriminator_name, i_edges)
+
+    loss_discriminator_edges, loss_generator_edges_adversarial = hinge_gan_loss(discriminator_edges_data, discriminator_edges_z)
 
     # Discriminator of real images
-    discriminator_data = build_discriminator(tf.concat([i_gt, mask, edges], axis=3))
-
+    tf.print(tf.shape(i_gt))
+    tf.print(tf.shape(mask))
+    tf.print(tf.shape(edges))
+    discriminator_data = build_discriminator(images_discriminator_name, tf.concat([i_gt, mask, edges], axis=3))
     # Discriminator of generated images
-    discriminator_z = build_discriminator(tf.concat([i_out, mask, edges], axis=3))
+    discriminator_z = build_discriminator(images_discriminator_name, tf.concat([i_out, mask, edges], axis=3))
 
-    loss_discriminator, loss_generator_adversarial = hinge_gan_loss(discriminator_data, discriminator_z)
-    # loss_discriminator, loss_generator_adversarial = ra_hinge_gan_loss(discriminator_data, discriminator_z)
+    loss_discriminator_images, loss_generator_adversarial = hinge_gan_loss(discriminator_data, discriminator_z)
+    # loss_discriminator_images, loss_generator_adversarial = ra_hinge_gan_loss(discriminator_data, discriminator_z)
 
-    loss_generator = coarse_l1_loss + refined_l1_loss + loss_generator_adversarial
+    loss_generator = edges_l1_loss + images_l1_loss + loss_generator_adversarial + loss_generator_edges_adversarial
 
     loss = loss_generator
 
-    tf.summary.scalar('loss_discriminator', loss_discriminator)
-    # tf.summary.scalar('loss_discriminator_data', loss_discriminator_data)
-    # tf.summary.scalar('loss_discriminator_z', loss_discriminator_z)
-    tf.summary.scalar('loss_generator_coarse_l1', coarse_l1_loss)
-    tf.summary.scalar('loss_generator_refined_l1', refined_l1_loss)
+    tf.summary.scalar('loss_discriminator_edges', loss_discriminator_edges)
+    tf.summary.scalar('loss_discriminator_images', loss_discriminator_images)
+    tf.summary.scalar('loss_generator_edges_l1', edges_l1_loss)
+    tf.summary.scalar('loss_generator_images_l1', images_l1_loss)
     tf.summary.scalar('loss_generator_adversarial', loss_generator_adversarial)
 
+    tf.print(tf.shape(edges))
+
     summary_image = tf.summary.image('image', tf.concat(
-        [float2int(i_gt), float2int(i_in), float2int(i_coarse), float2int(i_out)], axis=1))
+        [float2int(i_gt),
+         float2int(tf.image.grayscale_to_rgb(edges)),
+         float2int(i_in),
+         float2int(tf.image.grayscale_to_rgb(i_edges)),
+         float2int(i_out)], axis=1))
 
     if mode == tf.estimator.ModeKeys.EVAL:
         i_out = (i_out + 1) / 2.
@@ -136,16 +150,19 @@ def model_fn(features, labels, mode, params):
         ssim = tf.image.ssim(i_out, i_gt, 1.0)
         mean_ssim = tf.metrics.mean(ssim)
 
-        mean_coarse_l1_loss = tf.metrics.mean(coarse_l1_loss)
-        mean_refined_l1_loss = tf.metrics.mean(refined_l1_loss)
-        mean_loss_generator_adversarial = tf.metrics.mean(loss_generator_adversarial)
+        mean_edges_l1_loss = tf.metrics.mean(edges_l1_loss)
+        mean_images_l1_loss = tf.metrics.mean(images_l1_loss)
+        mean_generator_adversarial_loss = tf.metrics.mean(loss_generator_adversarial)
+        mean_disriminator_edges_loss = tf.metrics.mean(loss_discriminator_edges)
+        mean_disriminator_images_loss = tf.metrics.mean(loss_discriminator_images)
 
         metrics = {'psnr': mean_pnsr,
                    'ssim': mean_ssim,
-                   'loss_discriminator'
-                   'loss_generator_coarse_l1': mean_coarse_l1_loss,
-                   'loss_generator_refined_l1': mean_refined_l1_loss,
-                   'loss_generator_adversarial': mean_loss_generator_adversarial}
+                   'loss_discriminator_edges': mean_disriminator_edges_loss,
+                   'loss_discriminator_images': mean_disriminator_images_loss,
+                   'loss_generator_edges_l1': mean_edges_l1_loss,
+                   'loss_generator_images_l1': mean_images_l1_loss,
+                   'loss_generator_adversarial': mean_generator_adversarial_loss}
 
         tf.summary.scalar('psnr', mean_pnsr[0])
         tf.summary.scalar('ssim', mean_ssim[0])
@@ -183,7 +200,8 @@ def model_fn(features, labels, mode, params):
     d_optimizer = g_optimizer
 
     g_vars = tf.trainable_variables('generator/')
-    d_vars = tf.trainable_variables('discriminator/')
+    d_vars = tf.trainable_variables(edges_discriminator_name + '/')
+    d_vars += tf.trainable_variables(images_discriminator_name + '/')
 
     with tf.control_dependencies(tf.get_collection(tf.GraphKeys.UPDATE_OPS)):
         if params['float_type'] == tf.float16:
@@ -191,7 +209,7 @@ def model_fn(features, labels, mode, params):
             grads = gradients_with_loss_scaling(loss, variables, params['gradient_scale'])
             train_op = optimizer.apply_gradients(zip(grads, variables), global_step=global_step)
         else:
-            train_op_d = d_optimizer.minimize(loss_discriminator, var_list=d_vars,
+            train_op_d = d_optimizer.minimize(loss_discriminator_images, var_list=d_vars,
                                               global_step=global_step)
             train_op_g = g_optimizer.minimize(loss_generator, var_list=g_vars,
                                               global_step=global_step)
@@ -769,6 +787,8 @@ def custom_context_attenion(input_tensor, mask):
     mask = tf.reshape(mask, [batch_size, -1, 1])
     f = tf.matmul(input_tensor, input_tensor, transpose_b=True)
     scores = tf.nn.softmax(f * mask * 10) * mask
+    tf.summary.image('attention_scores', tf.expand_dims(scores, axis=3))
+    tf.summary.image('attention_scores', tf.expand_dims(scores, axis=3))
     y = tf.matmul(scores, input_tensor)
     y = tf.reshape(y, shape=[batch_size,
                              input_tensor_shape[1],
@@ -826,9 +846,37 @@ def custom_context_attenion2(input_tensor, depth):
         o = tf.layers.conv2d(o, depth, kernel_size=1, strides=1, name='attn_conv')
         gamma = tf.layers.conv2d(input_tensor, depth, kernel_size=1, strides=1, name='gamma_conv')  # [bs, h, w, c']
         gamma = tf.nn.sigmoid(gamma)
+        tf.summary.scalar('max_gamma', tf.reduce_max(gamma))
+        tf.summary.scalar('mean_gamma', tf.reduce_mean(gamma))
         x = o * gamma + input_tensor * (1 - gamma)
     return x
 
+
+def custom_context_attenion3(input_tensor, depth):
+    with tf.variable_scope(None, default_name='Attention'):
+        batch_size, height, width, num_channels = input_tensor.get_shape().as_list()
+        f = tf.layers.conv2d(input_tensor, depth, kernel_size=1, strides=1, name='f_conv')  # [bs, h, w, c']
+        # f = max_pooling(f)
+
+        g = tf.layers.conv2d(input_tensor, depth, kernel_size=1, strides=1, name='g_conv')  # [bs, h, w, c']
+
+        h = tf.layers.conv2d(input_tensor, depth, kernel_size=1, strides=1, name='h_conv')  # [bs, h, w, c]
+        # h = max_pooling(h)
+
+        # N = h * w
+        s = tf.matmul(hw_flatten(g), hw_flatten(f), transpose_b=True)  # # [bs, N, N]
+
+        beta = tf.nn.softmax(s)  # attention map
+
+        o = tf.matmul(beta, hw_flatten(h))  # [bs, N, C]
+        o = tf.reshape(o, shape=[batch_size, height, width, num_channels])  # [bs, h, w, C]
+        o = tf.layers.conv2d(o, depth, kernel_size=1, strides=1, name='attn_conv')
+        gamma = tf.layers.conv2d(input_tensor, depth, kernel_size=1, strides=1, name='gamma_conv')  # [bs, h, w, c']
+        gamma = tf.nn.sigmoid(gamma)
+        tf.summary.scalar('max_gamma', tf.reduce_max(gamma))
+        tf.summary.scalar('mean_gamma', tf.reduce_mean(gamma))
+        x = o * gamma + input_tensor * (1 - gamma)
+    return x
 
 def build_coarse_net(input_tensor):
     with tf.variable_scope('coarse_net'):
@@ -889,7 +937,7 @@ def build_coarse_net(input_tensor):
         net = gated_convolution(net, 3, cnum, 1, 1, lrelu)
         net = gated_convolution(net, 3, cnum // 2, 1, 1, lrelu)
 
-        net = regular_convolution(net, 3, 3, 1, 1)
+        net = regular_convolution(net, 3, 1, 1, 1)
         net = tf.clip_by_value(net, -1., 1.)
     return net
 
@@ -953,26 +1001,26 @@ def build_refinement_net(input_tensor, mask):
         net_hallu = net
 
         # Insert attention here
-        net = gated_convolution(input_tensor, 5, cnum, 1, 1, relu)
-
-        net = gated_convolution(net, 3, 2 * cnum, 2, 1, relu)
-        net = gated_convolution(net, 3, 2 * cnum, 1, 1, relu)
-
-        net = gated_convolution(net, 3, 4 * cnum, 2, 1, relu)
-        net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
-        net = gated_convolution(net, 3, 4 * cnum, 1, 1, tf.nn.relu)
-        # net, offset_flow = contextual_attention(net, net, mask, 3, 1, rate=2)
-        # net, offset_flow = contextual_attention(net, net, mask, 3, stride=1, rate=1,
-        #                                         fuse_k=3, softmax_scale=1.0, fuse=True)
+        # net = gated_convolution(input_tensor, 5, cnum, 1, 1, relu)
+        #
+        # net = gated_convolution(net, 3, 2 * cnum, 2, 1, relu)
+        # net = gated_convolution(net, 3, 2 * cnum, 1, 1, relu)
+        #
+        # net = gated_convolution(net, 3, 4 * cnum, 2, 1, relu)
+        # net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
+        # net = gated_convolution(net, 3, 4 * cnum, 1, 1, tf.nn.relu)
+        # # net, offset_flow = contextual_attention(net, net, mask, 3, 1, rate=2)
+        # # net, offset_flow = contextual_attention(net, net, mask, 3, stride=1, rate=1,
+        # #                                         fuse_k=3, softmax_scale=1.0, fuse=True)
         # net = custom_context_attenion(net, mask)
-        net = custom_context_attenion2(net, 4 * cnum)
-
-        net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
-        net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
-        pm = net
-
-        # Concatenating regular conv and attention branches
-        net = tf.concat([net_hallu, pm], axis=3)
+        # # net = custom_context_attenion2(net, 4 * cnum)
+        #
+        # net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
+        # net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
+        # pm = net
+        #
+        # # Concatenating regular conv and attention branches
+        # net = tf.concat([net_hallu, pm], axis=3)
 
         net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
         net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
@@ -995,18 +1043,19 @@ def build_generator(params, images, masks, edges, mode):
     # training = True if mode == tf.estimator.ModeKeys.TRAIN else False
 
     with tf.variable_scope('generator'):
-        images_masks_edges = tf.concat([images, masks, edges], axis=3)
-        coarse_result = build_coarse_net(images_masks_edges)
+        images_gray = tf.image.rgb_to_grayscale(images)
+        images_masks_edges = tf.concat([images_gray, masks, edges * masks], axis=3)
+        edges_result = build_coarse_net(images_masks_edges)
 
-        refinement_input_images = coarse_result * (1 - masks) + images * masks
-        refinement_input = tf.concat([refinement_input_images, masks, edges], axis=3)
+        # refinement_input_images = edges_result * (1 - masks) + images * masks
+        refinement_input = tf.concat([images, masks, edges_result], axis=3)
         refined_result = build_refinement_net(refinement_input, masks)
 
-        return refined_result, coarse_result
+        return refined_result, edges_result
 
 
-def build_discriminator(input_tensor):
-    with tf.variable_scope('discriminator', reuse=tf.AUTO_REUSE):
+def build_discriminator(name, input_tensor):
+    with tf.variable_scope(name, reuse=tf.AUTO_REUSE):
         # Change to leaky relu
         activation = tf.nn.leaky_relu
         cnum = int(64 * 1.0)

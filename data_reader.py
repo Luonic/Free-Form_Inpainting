@@ -2,15 +2,20 @@ from functools import partial
 import tensorflow as tf
 import os
 import model_builder
+from skimage.feature import canny
+import numpy as np
+from functools import partial
 
 FLAGS = tf.flags.FLAGS
-tf.flags.DEFINE_string('image_size', '512x512', '')
+tf.flags.DEFINE_string('image_size', '256x256', '')
 
 tf.flags.DEFINE_string('train_images_path', 'data/images/places365/train_large_places365standard/data_large/*/*', '')
 tf.flags.DEFINE_string('train_masks_path', 'data/masks/train', '')
 
 tf.flags.DEFINE_string('eval_images_path', 'data/images/places365/val_large', '')
 tf.flags.DEFINE_string('eval_masks_path', 'data/masks/eval', '')
+
+tf.flags.DEFINE_integer('canny_sigma', 0, 'Standart deviation of canny\'s gaussian filter')
 
 image_size = [int(dim) for dim in FLAGS.image_size.split("x")]
 
@@ -42,7 +47,7 @@ def resize_image_keep_aspect_ratio(image, max_height, max_width, use_min_ratio):
     new_height_and_width = compute_new_dims(height, width, max_height, max_width, use_min_ratio=use_min_ratio)
 
     image = tf.expand_dims(image, 0)
-    image = tf.image.resize_bicubic(image, tf.stack(new_height_and_width))
+    image = tf.image.resize_bilinear(image, tf.stack(new_height_and_width))
     image = tf.squeeze(image, [0])
     return image
 
@@ -56,8 +61,27 @@ def random_flip_left_right(tensors):
 
     return result_tensors
 
-def parse_images(image_filename, mask_filename, float_type):
+def extract_edges(input_array, sigma):
+    """
+    This function extracts Canny edges from image using Skimage
+    :param input_array: HxWx1 uint8 image
+    :return: HxWx1 uint8 image
+    """
 
+    x = np.squeeze(input_array, axis=2)
+
+    # print(sigma)
+
+    if sigma == 0:
+        sigma = np.random.randint(1, 4)
+
+
+    x = canny(x, sigma=sigma).astype(np.uint8)
+    x = np.expand_dims(x, axis=2)
+    print(x.shape)
+    return x
+
+def parse_images(image_filename, mask_filename, float_type):
     image_file = tf.read_file(image_filename)
     mask_file = tf.read_file(mask_filename)
 
@@ -72,13 +96,18 @@ def parse_images(image_filename, mask_filename, float_type):
     image_gt, edges = tf.split(image_and_edges, [3, 1], axis=2)
     image_gt, edges = random_flip_left_right([image_gt, edges])
 
+    partial_extract_edges = partial(extract_edges, sigma=FLAGS.canny_sigma)
+    edges = tf.image.rgb_to_grayscale(image_gt)
+    edges = tf.cast(edges, tf.uint8)
+    edges = tf.py_func(partial_extract_edges, [edges], [tf.uint8], stateful=True, name='Canny_PyFunc')
+
     image_gt = tf.cast(image_gt, float_type)
     image_gt = model_builder.int2float(image_gt)
     image_gt.set_shape((None, None, 3))
 
     edges = tf.cast(edges, float_type)
-    edges = tf.cast(tf.greater(edges, 127), dtype=float_type)
-    edges *= 0
+    # edges = tf.cast(tf.greater(edges, 127), dtype=float_type)
+    # edges *= 0
     edges.set_shape((None, None, 1))
 
     mask = tf.image.decode_image(mask_file, channels=1)
