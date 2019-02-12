@@ -8,9 +8,9 @@ flags = tf.flags
 FLAGS = flags.FLAGS
 
 flags.DEFINE_integer('batch_size', 1, '')
-flags.DEFINE_string("logs_dir", "train_logs/9_256_my_contextual_attention", "")
+flags.DEFINE_string("logs_dir", "train_logs/ec_256_1_no-attention", "")
 flags.DEFINE_string("start_checkpoint", None, "")
-flags.DEFINE_integer("log_steps_n", 1, "")  # 250
+flags.DEFINE_integer("log_steps_n", 2, "")  # 250
 
 
 def main(argv):
@@ -20,6 +20,8 @@ def main(argv):
               'gradient_scale': 1.0,  # Used during fp16 training.
               'leaky_relu_alpha': 0.2,
               'learning_rate': 0.0001,
+              'gamma_adversarial': 1, # Scale of adversarial loss for G
+              'gamma_feature': 10, # Scale of feature loss for G
               'num_steps_start_lr_decay': 500000,
               'max_iter': 1000000,
               'quantize': False}

@@ -6,6 +6,7 @@ from coord_conv import AddCoords
 edges_discriminator_name = 'edges_discriminator'
 images_discriminator_name = 'image_discriminator'
 
+
 def float2int(float_image):
     return tf.cast(tf.clip_by_value((float_image + 1) * 127.0, 0, 255), dtype=tf.uint8)
     # return tf.cast(tf.clip_by_value(float_image, 0.0, 255.0), dtype=tf.uint8)
@@ -89,10 +90,13 @@ def serving_input_receiver_fn(float_type):
 
 def model_fn(features, labels, mode, params):
     i_in = features['i_in']
-    mask = features['mask']
+    masks = features['masks']
     edges = features['edges']
 
-    i_out, i_edges = build_generator(params, i_in, mask, edges, mode)
+    edges_input = edges * masks
+    edges_label = edges  # * (1 - masks)
+
+    i_out, i_edges = build_generator(params, i_in, masks, edges_input, mode)
 
     if mode == tf.estimator.ModeKeys.PREDICT:
         export_outputs = {'predict_output': tf.estimator.export.PredictOutput({"i_out": i_out})}
@@ -102,43 +106,52 @@ def model_fn(features, labels, mode, params):
     # Compute loss.
     i_gt = features['i_gt']
 
-    edges_l1_loss = tf.reduce_mean(tf.abs(i_edges - i_gt))
-    images_l1_loss = tf.reduce_mean(tf.abs(i_out - i_gt))
+    edges_l1_loss = tf.reduce_mean(tf.abs(i_edges - edges_label))
+    images_l1_loss = tf.reduce_mean(
+        tf.reduce_mean(tf.abs(i_out - i_gt), axis=[1, 2, 3]) /
+        (tf.reduce_mean(1 - masks, axis=[1, 2, 3]) + 0.00001))
 
-    discriminator_edges_data = build_discriminator(edges_discriminator_name, edges)
-    discriminator_edges_z = build_discriminator(edges_discriminator_name, i_edges)
+    discriminator_edges_data, discriminator_edges_data_features = build_discriminator(edges_discriminator_name, edges)
+    discriminator_edges_z, discriminator_edges_z_features = build_discriminator(edges_discriminator_name, i_edges)
 
-    loss_discriminator_edges, loss_generator_edges_adversarial = hinge_gan_loss(discriminator_edges_data, discriminator_edges_z)
+    loss_discriminator_edges, loss_generator_edges_adversarial = hinge_gan_loss(discriminator_edges_data,
+                                                                                discriminator_edges_z)
 
     # Discriminator of real images
-    tf.print(tf.shape(i_gt))
-    tf.print(tf.shape(mask))
-    tf.print(tf.shape(edges))
-    discriminator_data = build_discriminator(images_discriminator_name, tf.concat([i_gt, mask, edges], axis=3))
+    discriminator_images_data, discriminator_images_data_features = build_discriminator(images_discriminator_name,
+                                                                                        tf.concat([i_gt, masks, edges],
+                                                                                                  axis=3))
     # Discriminator of generated images
-    discriminator_z = build_discriminator(images_discriminator_name, tf.concat([i_out, mask, edges], axis=3))
+    discriminator_images_z, discriminator_images_z_features = build_discriminator(images_discriminator_name,
+                                                                                  tf.concat([i_out, masks, edges],
+                                                                                            axis=3))
 
-    loss_discriminator_images, loss_generator_adversarial = hinge_gan_loss(discriminator_data, discriminator_z)
-    # loss_discriminator_images, loss_generator_adversarial = ra_hinge_gan_loss(discriminator_data, discriminator_z)
+    loss_discriminator_images, loss_generator_adversarial = hinge_gan_loss(discriminator_images_data,
+                                                                           discriminator_images_z)
+    # loss_discriminator_images, loss_generator_adversarial = ra_hinge_gan_loss(discriminator_images_data, discriminator_images_z)
 
-    loss_generator = edges_l1_loss + images_l1_loss + loss_generator_adversarial + loss_generator_edges_adversarial
+    edges_feature_matching_loss = feature_matching_loss(discriminator_edges_data_features,
+                                                        discriminator_edges_z_features)
+
+    loss_generator = edges_l1_loss + images_l1_loss + \
+                     params['gamma_adversarial'] * (loss_generator_adversarial + loss_generator_edges_adversarial) + \
+                     params['gamma_feature'] * edges_feature_matching_loss
 
     loss = loss_generator
 
     tf.summary.scalar('loss_discriminator_edges', loss_discriminator_edges)
     tf.summary.scalar('loss_discriminator_images', loss_discriminator_images)
+    tf.summary.scalar('loss_generator_edges_feature_matching', edges_feature_matching_loss)
     tf.summary.scalar('loss_generator_edges_l1', edges_l1_loss)
     tf.summary.scalar('loss_generator_images_l1', images_l1_loss)
     tf.summary.scalar('loss_generator_adversarial', loss_generator_adversarial)
 
-    tf.print(tf.shape(edges))
-
     summary_image = tf.summary.image('image', tf.concat(
-        [float2int(i_gt),
-         float2int(tf.image.grayscale_to_rgb(edges)),
-         float2int(i_in),
-         float2int(tf.image.grayscale_to_rgb(i_edges)),
-         float2int(i_out)], axis=1))
+        [tf.concat([float2int(i_gt), float2int(i_out)], axis=2),
+         tf.concat([float2int(tf.image.grayscale_to_rgb(edges)), float2int(tf.image.grayscale_to_rgb(i_edges))],
+                   axis=2),
+         tf.concat([float2int(i_in), float2int(i_out)], axis=2)],
+        axis=1))
 
     if mode == tf.estimator.ModeKeys.EVAL:
         i_out = (i_out + 1) / 2.
@@ -209,7 +222,7 @@ def model_fn(features, labels, mode, params):
             grads = gradients_with_loss_scaling(loss, variables, params['gradient_scale'])
             train_op = optimizer.apply_gradients(zip(grads, variables), global_step=global_step)
         else:
-            train_op_d = d_optimizer.minimize(loss_discriminator_images, var_list=d_vars,
+            train_op_d = d_optimizer.minimize(loss_discriminator_images + loss_discriminator_edges, var_list=d_vars,
                                               global_step=global_step)
             train_op_g = g_optimizer.minimize(loss_generator, var_list=g_vars,
                                               global_step=global_step)
@@ -273,6 +286,17 @@ def ra_hinge_gan_loss(discriminator_data, discriminator_z):
     loss_generator_adversarial = (tf.reduce_mean(tf.nn.relu(1 - d_z)) + tf.reduce_mean(tf.nn.relu(1 + d_r)))  # / 2
 
     return loss_discriminator, loss_generator_adversarial
+
+
+def feature_matching_loss(features_a, features_b):
+    assert len(features_a) == len(features_b)
+
+    losses = []
+
+    for tensor_a, tensor_b in zip(features_a, features_b):
+        losses.append(tf.reduce_mean(tf.abs(tensor_a - tensor_b)))
+
+    return tf.add_n(losses)
 
 
 def normalize(input_tensor, training):
@@ -878,6 +902,7 @@ def custom_context_attenion3(input_tensor, depth):
         x = o * gamma + input_tensor * (1 - gamma)
     return x
 
+
 def build_coarse_net(input_tensor):
     with tf.variable_scope('coarse_net'):
         # relu = tf.nn.relu
@@ -1047,8 +1072,11 @@ def build_generator(params, images, masks, edges, mode):
         images_masks_edges = tf.concat([images_gray, masks, edges * masks], axis=3)
         edges_result = build_coarse_net(images_masks_edges)
 
+        # edges_input = edges_result * (1 - masks) + edges
+        edges_input = edges_result
+
         # refinement_input_images = edges_result * (1 - masks) + images * masks
-        refinement_input = tf.concat([images, masks, edges_result], axis=3)
+        refinement_input = tf.concat([images, masks, edges_input], axis=3)
         refined_result = build_refinement_net(refinement_input, masks)
 
         return refined_result, edges_result
@@ -1060,10 +1088,11 @@ def build_discriminator(name, input_tensor):
         activation = tf.nn.leaky_relu
         cnum = int(64 * 1.0)
 
-        net = conv2d_spectral_norm(input_tensor, cnum, 5, 1, 'SAME', activation=activation, name='conv1')
-        net = conv2d_spectral_norm(net, cnum * 2, 5, 2, 'SAME', activation=activation, name='conv2')
-        net = conv2d_spectral_norm(net, cnum * 4, 5, 2, 'SAME', activation=activation, name='conv3')
-        net = conv2d_spectral_norm(net, cnum * 4, 5, 2, 'SAME', activation=activation, name='conv4')
-        net = conv2d_spectral_norm(net, cnum * 4, 5, 2, 'SAME', activation=activation, name='conv5')
-        net = conv2d_spectral_norm(net, cnum * 4, 5, 2, 'SAME', activation=activation, name='conv6')
-        return net
+        conv1 = conv2d_spectral_norm(input_tensor, cnum, 5, 1, 'SAME', activation=activation, name='conv1')
+        conv2 = conv2d_spectral_norm(conv1, cnum * 2, 5, 2, 'SAME', activation=activation, name='conv2')
+        conv3 = conv2d_spectral_norm(conv2, cnum * 4, 5, 2, 'SAME', activation=activation, name='conv3')
+        conv4 = conv2d_spectral_norm(conv3, cnum * 4, 5, 2, 'SAME', activation=activation, name='conv4')
+        conv5 = conv2d_spectral_norm(conv4, cnum * 4, 5, 2, 'SAME', activation=activation, name='conv5')
+        conv6 = conv2d_spectral_norm(conv5, cnum * 4, 5, 2, 'SAME', activation=activation, name='conv6')
+        features = [conv1, conv2, conv3, conv4, conv5, conv6]
+        return conv6, features

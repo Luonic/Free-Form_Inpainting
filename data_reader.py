@@ -15,7 +15,7 @@ tf.flags.DEFINE_string('train_masks_path', 'data/masks/train', '')
 tf.flags.DEFINE_string('eval_images_path', 'data/images/places365/val_large', '')
 tf.flags.DEFINE_string('eval_masks_path', 'data/masks/eval', '')
 
-tf.flags.DEFINE_integer('canny_sigma', 0, 'Standart deviation of canny\'s gaussian filter')
+tf.flags.DEFINE_integer('canny_sigma', 1, 'Standart deviation of canny\'s gaussian filter')
 
 image_size = [int(dim) for dim in FLAGS.image_size.split("x")]
 
@@ -68,7 +68,7 @@ def extract_edges(input_array, sigma):
     :return: HxWx1 uint8 image
     """
 
-    x = np.squeeze(input_array, axis=2)
+    x = np.squeeze(input_array, axis=-1)
 
     # print(sigma)
 
@@ -77,8 +77,7 @@ def extract_edges(input_array, sigma):
 
 
     x = canny(x, sigma=sigma).astype(np.uint8)
-    x = np.expand_dims(x, axis=2)
-    print(x.shape)
+    x = np.expand_dims(x, axis=-1)
     return x
 
 def parse_images(image_filename, mask_filename, float_type):
@@ -99,16 +98,15 @@ def parse_images(image_filename, mask_filename, float_type):
     partial_extract_edges = partial(extract_edges, sigma=FLAGS.canny_sigma)
     edges = tf.image.rgb_to_grayscale(image_gt)
     edges = tf.cast(edges, tf.uint8)
-    edges = tf.py_func(partial_extract_edges, [edges], [tf.uint8], stateful=True, name='Canny_PyFunc')
-
-    image_gt = tf.cast(image_gt, float_type)
-    image_gt = model_builder.int2float(image_gt)
-    image_gt.set_shape((None, None, 3))
-
+    edges = tf.py_func(partial_extract_edges, [edges], [tf.uint8], stateful=True, name='Canny_PyFunc')[0]
     edges = tf.cast(edges, float_type)
     # edges = tf.cast(tf.greater(edges, 127), dtype=float_type)
     # edges *= 0
     edges.set_shape((None, None, 1))
+
+    image_gt = tf.cast(image_gt, float_type)
+    image_gt = model_builder.int2float(image_gt)
+    image_gt.set_shape((None, None, 3))
 
     mask = tf.image.decode_image(mask_file, channels=1)
     mask = resize_image_keep_aspect_ratio(mask, image_size[0], image_size[1], use_min_ratio=True)
@@ -118,7 +116,7 @@ def parse_images(image_filename, mask_filename, float_type):
     mask.set_shape((None, None, 1))
 
     image_in = image_gt * mask
-    features = {'i_in': image_in, 'i_gt': image_gt, 'mask': mask, 'edges': edges}
+    features = {'i_in': image_in, 'i_gt': image_gt, 'masks': mask, 'edges': edges}
     return features
 
 def train_input_fn(params, batch_size):
