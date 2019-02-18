@@ -1,5 +1,7 @@
 import tensorflow as tf
 import data_reader
+from math import floor, ceil
+from functools import partial
 from conv2d_spectral_norm import conv2d_spectral_norm
 from coord_conv import AddCoords
 
@@ -76,10 +78,10 @@ def serving_input_receiver_fn(float_type):
                                             data_reader.image_size[1],
                                             3],
                                      dtype=float_type),
-              "mask": tf.placeholder(shape=[1, data_reader.image_size[0],
-                                            data_reader.image_size[1],
-                                            1],
-                                     dtype=float_type),
+              "masks": tf.placeholder(shape=[1, data_reader.image_size[0],
+                                             data_reader.image_size[1],
+                                             1],
+                                      dtype=float_type),
               "edges": tf.placeholder(shape=[1, data_reader.image_size[0],
                                              data_reader.image_size[1],
                                              1],
@@ -93,10 +95,9 @@ def model_fn(features, labels, mode, params):
     masks = features['masks']
     edges = features['edges']
 
-    edges_input = edges * masks
     edges_label = edges  # * (1 - masks)
 
-    i_out, i_edges = build_generator(params, i_in, masks, edges_input, mode)
+    i_out, i_edges = build_generator(params, i_in, masks, edges, mode)
 
     if mode == tf.estimator.ModeKeys.PREDICT:
         export_outputs = {'predict_output': tf.estimator.export.PredictOutput({"i_out": i_out})}
@@ -106,45 +107,64 @@ def model_fn(features, labels, mode, params):
     # Compute loss.
     i_gt = features['i_gt']
 
-    edges_l1_loss = tf.reduce_mean(tf.abs(i_edges - edges_label))
-    images_l1_loss = tf.reduce_mean(
-        tf.reduce_mean(tf.abs(i_out - i_gt), axis=[1, 2, 3]) /
+    # edges_l1_loss = tf.reduce_mean(tf.abs(i_edges - edges_label))
+    edges_l1_loss = tf.reduce_mean(
+        tf.reduce_mean(tf.abs(i_edges - edges_label), axis=[1, 2, 3]) /
         (tf.reduce_mean(1 - masks, axis=[1, 2, 3]) + 0.00001))
+    # images_l1_loss = tf.reduce_mean(
+    #     tf.reduce_mean(tf.abs(i_out - i_gt), axis=[1, 2, 3]) /
+    #     (tf.reduce_mean(1 - masks, axis=[1, 2, 3]) + 0.00001))
+    images_l1_loss = tf.reduce_mean(tf.abs(i_out - i_gt))
 
-    discriminator_edges_data, discriminator_edges_data_features = build_discriminator(edges_discriminator_name, edges)
-    discriminator_edges_z, discriminator_edges_z_features = build_discriminator(edges_discriminator_name, i_edges)
+    i_gt_gray = tf.image.rgb_to_grayscale(i_gt)
+
+    discriminator_edges_data, discriminator_edges_data_features = \
+        build_discriminator(edges_discriminator_name, tf.concat([i_gt_gray, edges, masks], axis=-1))
+    discriminator_edges_z, discriminator_edges_z_features = \
+        build_discriminator(edges_discriminator_name, tf.concat([i_gt_gray, i_edges, masks], axis=-1))
 
     loss_discriminator_edges, loss_generator_edges_adversarial = hinge_gan_loss(discriminator_edges_data,
                                                                                 discriminator_edges_z)
 
-    # Discriminator of real images
-    discriminator_images_data, discriminator_images_data_features = build_discriminator(images_discriminator_name,
-                                                                                        tf.concat([i_gt, masks, edges],
-                                                                                                  axis=3))
-    # Discriminator of generated images
-    discriminator_images_z, discriminator_images_z_features = build_discriminator(images_discriminator_name,
-                                                                                  tf.concat([i_out, masks, edges],
-                                                                                            axis=3))
+    edges_comp = edges * masks + i_edges * (1 - masks)
 
-    loss_discriminator_images, loss_generator_adversarial = hinge_gan_loss(discriminator_images_data,
-                                                                           discriminator_images_z)
+    # Discriminator of real images
+    discriminator_images_data, discriminator_images_data_features = \
+        build_discriminator(images_discriminator_name, tf.concat([i_gt, edges_comp], axis=3))
+    # Discriminator of generated images
+    discriminator_images_z, discriminator_images_z_features = \
+        build_discriminator(images_discriminator_name, tf.concat([i_out, edges_comp], axis=3))
+
+    loss_discriminator_images, loss_generator_images_adversarial = hinge_gan_loss(discriminator_images_data,
+                                                                                  discriminator_images_z)
     # loss_discriminator_images, loss_generator_adversarial = ra_hinge_gan_loss(discriminator_images_data, discriminator_images_z)
 
     edges_feature_matching_loss = feature_matching_loss(discriminator_edges_data_features,
                                                         discriminator_edges_z_features)
 
-    loss_generator = edges_l1_loss + images_l1_loss + \
-                     params['gamma_adversarial'] * (loss_generator_adversarial + loss_generator_edges_adversarial) + \
-                     params['gamma_feature'] * edges_feature_matching_loss
+    # images_feature_matching_loss = feature_matching_loss(discriminator_images_data_features,
+    #                                                     discriminator_images_z_features)
+
+    loss_generator = 0
+    # loss_generator += edges_l1_loss + images_l1_loss
+    loss_generator += params['gamma_adversarial'] * loss_generator_edges_adversarial + \
+                      params['gamma_feature'] * edges_feature_matching_loss
+    loss_generator += params['gamma_adversarial'] * loss_generator_images_adversarial + \
+                      images_l1_loss
+
+    # loss_generator = params['gamma_adversarial'] * (loss_generator_edges_adversarial) + \
+    #                  params['gamma_feature'] * edges_feature_matching_loss
 
     loss = loss_generator
 
     tf.summary.scalar('loss_discriminator_edges', loss_discriminator_edges)
     tf.summary.scalar('loss_discriminator_images', loss_discriminator_images)
     tf.summary.scalar('loss_generator_edges_feature_matching', edges_feature_matching_loss)
+    # tf.summary.scalar('loss_generator_images_feature_matching', images_feature_matching_loss)
     tf.summary.scalar('loss_generator_edges_l1', edges_l1_loss)
     tf.summary.scalar('loss_generator_images_l1', images_l1_loss)
-    tf.summary.scalar('loss_generator_adversarial', loss_generator_adversarial)
+    tf.summary.scalar('loss_generator_edges_adversarial', loss_generator_edges_adversarial)
+    tf.summary.scalar('loss_generator_images_adversarial', loss_generator_images_adversarial)
 
     summary_image = tf.summary.image('image', tf.concat(
         [tf.concat([float2int(i_gt), float2int(i_out)], axis=2),
@@ -165,7 +185,8 @@ def model_fn(features, labels, mode, params):
 
         mean_edges_l1_loss = tf.metrics.mean(edges_l1_loss)
         mean_images_l1_loss = tf.metrics.mean(images_l1_loss)
-        mean_generator_adversarial_loss = tf.metrics.mean(loss_generator_adversarial)
+        mean_generator_edges_adversarial_loss = tf.metrics.mean(loss_generator_edges_adversarial)
+        mean_generator_images_adversarial_loss = tf.metrics.mean(loss_generator_images_adversarial)
         mean_disriminator_edges_loss = tf.metrics.mean(loss_discriminator_edges)
         mean_disriminator_images_loss = tf.metrics.mean(loss_discriminator_images)
 
@@ -175,7 +196,8 @@ def model_fn(features, labels, mode, params):
                    'loss_discriminator_images': mean_disriminator_images_loss,
                    'loss_generator_edges_l1': mean_edges_l1_loss,
                    'loss_generator_images_l1': mean_images_l1_loss,
-                   'loss_generator_adversarial': mean_generator_adversarial_loss}
+                   'loss_generator_edges_adversarial': mean_generator_edges_adversarial_loss,
+                   'loss_generator_images_adversarial': mean_generator_images_adversarial_loss}
 
         tf.summary.scalar('psnr', mean_pnsr[0])
         tf.summary.scalar('ssim', mean_ssim[0])
@@ -209,7 +231,7 @@ def model_fn(features, labels, mode, params):
         learning_rate = params['learning_rate'] * lr_multiplier
     tf.summary.scalar('learning_rate', learning_rate)
 
-    g_optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=0.5, beta2=0.9)
+    g_optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=0.0, beta2=0.9)
     d_optimizer = g_optimizer
 
     g_vars = tf.trainable_variables('generator/')
@@ -461,7 +483,12 @@ def sn_conv2d(inputs,
 def upsample_x2(input_tensor):
     scale = 2
     shape = tf.shape(input_tensor)
-    return tf.image.resize_nearest_neighbor(input_tensor, [shape[1] * scale, shape[2] * scale])
+    # return tf.image.resize_nearest_neighbor(input_tensor, [shape[1] * scale, shape[2] * scale])
+    return tf.layers.conv2d_transpose(input_tensor,
+                                      filters=input_tensor.get_shape().as_list()[-1],
+                                      kernel_size=4,
+                                      strides=2,
+                                      padding='same')
 
 
 def resize(x, scale=2., to_shape=None, align_corners=True, dynamic=False,
@@ -903,162 +930,123 @@ def custom_context_attenion3(input_tensor, depth):
     return x
 
 
+def c(inputs, filters, sn=False, inst_norm=True, activation=True):
+    with tf.variable_scope(None, default_name='c'):
+        ksize = 7
+        rate = 1
+        p = int(floor(rate * (ksize - 1))) // 2
+        p2 = int(ceil(rate * (ksize - 1))) // 2
+        x = tf.pad(inputs, [[0, 0], [p, p2], [p, p2], [0, 0]], mode='REFLECT')
+        if sn:
+            x = conv2d_spectral_norm(inputs=x, filters=filters, kernel_size=ksize, padding='valid')
+        else:
+            x = tf.layers.conv2d(inputs=x, filters=filters, kernel_size=ksize, padding='valid')
+
+        if inst_norm:
+            x = tf.contrib.layers.instance_norm(inputs=x, trainable=False)
+        if activation:
+            x = tf.nn.relu(x)
+        return x
+
+def d(inputs, filters, sn=False):
+    with tf.variable_scope(None, default_name='d'):
+        ksize = 4
+        if sn:
+            x = conv2d_spectral_norm(inputs=inputs, filters=filters, kernel_size=ksize, strides=2, padding='same')
+        else:
+            x = tf.layers.conv2d(inputs=inputs, filters=filters, kernel_size=ksize, strides=2, padding='same')
+        x = tf.contrib.layers.instance_norm(inputs=x, trainable=False)
+        x = tf.nn.relu(x)
+        return x
+
+def u(inputs, filters, sn=False):
+    with tf.variable_scope(None, default_name='u'):
+        ksize = 4
+        x = tf.layers.conv2d_transpose(inputs=inputs, filters=filters, kernel_size=ksize, strides=2, padding='same')
+        x = tf.contrib.layers.instance_norm(inputs=x, trainable=False)
+        x = tf.nn.relu(x)
+        return x
+
+def r(inputs, filters, sn=False):
+    with tf.variable_scope(None, default_name='r'):
+        ksize = 3
+        rate = 2
+        p = int(floor(rate * (ksize - 1))) // 2
+        p2 = int(ceil(rate * (ksize - 1))) // 2
+        x = tf.pad(inputs, [[0, 0], [p, p2], [p, p2], [0, 0]], mode='REFLECT')
+        if sn:
+            x = conv2d_spectral_norm(inputs=x, filters=filters, kernel_size=ksize, dilation_rate=rate, padding='valid')
+        else:
+            x = tf.layers.conv2d(inputs=x, filters=filters, kernel_size=ksize, dilation_rate=rate, padding='valid')
+        x = tf.contrib.layers.instance_norm(inputs=x, trainable=False)
+        x = tf.nn.relu(x)
+
+        ksize = 3
+        rate = 1
+        p = int(floor(rate * (ksize - 1))) // 2
+        p2 = int(ceil(rate * (ksize - 1))) // 2
+        x = tf.pad(x, [[0, 0], [p, p2], [p, p2], [0, 0]], mode='REFLECT')
+        if sn:
+            x = conv2d_spectral_norm(inputs=x, filters=filters, kernel_size=ksize, padding='valid')
+        else:
+            x = tf.layers.conv2d(inputs=x, filters=filters, kernel_size=ksize, padding='valid')
+        x = tf.contrib.layers.instance_norm(inputs=x, trainable=False)
+        x += inputs
+        return x
+
+
+
+
 def build_coarse_net(input_tensor):
-    with tf.variable_scope('coarse_net'):
-        # relu = tf.nn.relu
-        # lrelu = tf.nn.leaky_relu
-
-        # Looks like ELU allow to get rid of batch normalization because of normalizing properties
-        # of this activation function
-        relu = tf.nn.elu
-        lrelu = relu
-        cnum = int(32 * 0.75)
-
-        # Net arch from deepfill v1
-        # x = gen_conv(x, cnum, 5, 1, name='conv1')
-        # x = gen_conv(x, 2 * cnum, 3, 2, name='conv2_downsample')
-        # x = gen_conv(x, 2 * cnum, 3, 1, name='conv3')
-        # x = gen_conv(x, 4 * cnum, 3, 2, name='conv4_downsample')
-        # x = gen_conv(x, 4 * cnum, 3, 1, name='conv5')
-        # x = gen_conv(x, 4 * cnum, 3, 1, name='conv6')
-        # mask_s = resize_mask_like(mask, x)
-        # x = gen_conv(x, 4 * cnum, 3, rate=2, name='conv7_atrous')
-        # x = gen_conv(x, 4 * cnum, 3, rate=4, name='conv8_atrous')
-        # x = gen_conv(x, 4 * cnum, 3, rate=8, name='conv9_atrous')
-        # x = gen_conv(x, 4 * cnum, 3, rate=16, name='conv10_atrous')
-        # x = gen_conv(x, 4 * cnum, 3, 1, name='conv11')
-        # x = gen_conv(x, 4 * cnum, 3, 1, name='conv12')
-        # x = gen_deconv(x, 2 * cnum, name='conv13_upsample')
-        # x = gen_conv(x, 2 * cnum, 3, 1, name='conv14')
-        # x = gen_deconv(x, cnum, name='conv15_upsample')
-        # x = gen_conv(x, cnum // 2, 3, 1, name='conv16')
-        # x = gen_conv(x, 3, 3, 1, activation=None, name='conv17')
-        # x = tf.clip_by_value(x, -1., 1.)
-        # x_stage1 = x
+    with tf.variable_scope('edge_net'):
+        cnum = int(64 * 1.0)
 
         # Args are: input_tensor, kernel_size, depth, stride, dilation_rate, activation
-        net = gated_convolution(input_tensor, 5, cnum, 1, 1, relu)
+        net = c(input_tensor, 64, sn=True)
 
-        net = gated_convolution(net, 3, 2 * cnum, 2, 1, relu)
-        net = gated_convolution(net, 3, 2 * cnum, 1, 1, relu)
+        net = d(net, 128, sn=True)
+        net = d(net, 256, sn=True)
 
-        net = gated_convolution(net, 3, 4 * cnum, 2, 1, relu)
-        net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
-        net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
+        net = r(net, 256, sn=True)
+        net = r(net, 256, sn=True)
+        net = r(net, 256, sn=True)
+        net = r(net, 256, sn=True)
+        net = r(net, 256, sn=True)
+        net = r(net, 256, sn=True)
+        net = r(net, 256, sn=True)
+        net = r(net, 256, sn=True)
 
-        net = gated_convolution(net, 3, 4 * cnum, 1, 2, relu)
-        net = gated_convolution(net, 3, 4 * cnum, 1, 4, relu)
-        net = gated_convolution(net, 3, 4 * cnum, 1, 8, relu)
-        net = gated_convolution(net, 3, 4 * cnum, 1, 16, relu)
+        net = u(net, 128, sn=True)
+        net = u(net, 64, sn=True)
+        net = c(net, 1, sn=True, inst_norm=False, activation=False)
+        net = tf.nn.sigmoid(net)
 
-        net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
-        net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
-
-        net = upsample_x2(net)
-        net = gated_convolution(net, 3, 2 * cnum, 1, 1, lrelu)
-        net = gated_convolution(net, 3, 2 * cnum, 1, 1, lrelu)
-
-        net = upsample_x2(net)
-        net = gated_convolution(net, 3, cnum, 1, 1, lrelu)
-        net = gated_convolution(net, 3, cnum // 2, 1, 1, lrelu)
-
-        net = regular_convolution(net, 3, 1, 1, 1)
-        net = tf.clip_by_value(net, -1., 1.)
+        # net = tf.clip_by_value(net, -1., 1.)
     return net
 
 
 def build_refinement_net(input_tensor, mask):
-    # relu = tf.nn.relu
-    # lrelu = tf.nn.leaky_relu
-    relu = tf.nn.elu
-    lrelu = relu
-    cnum = int(32 * 0.75)
+    cnum = int(32 * 1.0)
 
-    with tf.variable_scope('refinement_net'):
-        # x = gen_conv(xnow, cnum, 5, 1, name='xconv1')
-        # x = gen_conv(x, cnum, 3, 2, name='xconv2_downsample')
-        # x = gen_conv(x, 2 * cnum, 3, 1, name='xconv3')
-        # x = gen_conv(x, 2 * cnum, 3, 2, name='xconv4_downsample')
-        # x = gen_conv(x, 4 * cnum, 3, 1, name='xconv5')
-        # x = gen_conv(x, 4 * cnum, 3, 1, name='xconv6')
-        # x = gen_conv(x, 4 * cnum, 3, rate=2, name='xconv7_atrous')
-        # x = gen_conv(x, 4 * cnum, 3, rate=4, name='xconv8_atrous')
-        # x = gen_conv(x, 4 * cnum, 3, rate=8, name='xconv9_atrous')
-        # x = gen_conv(x, 4 * cnum, 3, rate=16, name='xconv10_atrous')
-        # x_hallu = x
-        # # attention branch
-        # x = gen_conv(xnow, cnum, 5, 1, name='pmconv1')
-        # x = gen_conv(x, cnum, 3, 2, name='pmconv2_downsample')
-        # x = gen_conv(x, 2 * cnum, 3, 1, name='pmconv3')
-        # x = gen_conv(x, 4 * cnum, 3, 2, name='pmconv4_downsample')
-        # x = gen_conv(x, 4 * cnum, 3, 1, name='pmconv5')
-        # x = gen_conv(x, 4 * cnum, 3, 1, name='pmconv6',
-        #              activation=tf.nn.relu)
-        # x, offset_flow = contextual_attention(x, x, mask_s, 3, 1, rate=2)
-        # x = gen_conv(x, 4 * cnum, 3, 1, name='pmconv9')
-        # x = gen_conv(x, 4 * cnum, 3, 1, name='pmconv10')
-        # pm = x
-        # x = tf.concat([x_hallu, pm], axis=3)
-        #
-        # x = gen_conv(x, 4 * cnum, 3, 1, name='allconv11')
-        # x = gen_conv(x, 4 * cnum, 3, 1, name='allconv12')
-        # x = gen_deconv(x, 2 * cnum, name='allconv13_upsample')
-        # x = gen_conv(x, 2 * cnum, 3, 1, name='allconv14')
-        # x = gen_deconv(x, cnum, name='allconv15_upsample')
-        # x = gen_conv(x, cnum // 2, 3, 1, name='allconv16')
-        # x = gen_conv(x, 3, 3, 1, activation=None, name='allconv17')
-        # x_stage2 = tf.clip_by_value(x, -1., 1.)
+    with tf.variable_scope('inpainting_net'):
+        net = c(input_tensor, cnum)
 
-        # Args are: input_tensor, kernel_size, depth, stride, dilation_rate, activation
-        net = gated_convolution(input_tensor, 5, cnum, 1, 1, relu)
+        net = d(net, 128)
+        net = d(net, 256)
 
-        net = gated_convolution(net, 3, 2 * cnum, 2, 1, relu)
-        net = gated_convolution(net, 3, 2 * cnum, 1, 1, relu)
+        net = r(net, 256)
+        net = r(net, 256)
+        net = r(net, 256)
+        net = r(net, 256)
+        net = r(net, 256)
+        net = r(net, 256)
+        net = r(net, 256)
+        net = r(net, 256)
 
-        net = gated_convolution(net, 3, 4 * cnum, 2, 1, relu)
-        net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
-        net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
-
-        net = gated_convolution(net, 3, 4 * cnum, 1, 2, relu)
-        net = gated_convolution(net, 3, 4 * cnum, 1, 4, relu)
-        net = gated_convolution(net, 3, 4 * cnum, 1, 8, relu)
-        net = gated_convolution(net, 3, 4 * cnum, 1, 16, relu)
-        net_hallu = net
-
-        # Insert attention here
-        # net = gated_convolution(input_tensor, 5, cnum, 1, 1, relu)
-        #
-        # net = gated_convolution(net, 3, 2 * cnum, 2, 1, relu)
-        # net = gated_convolution(net, 3, 2 * cnum, 1, 1, relu)
-        #
-        # net = gated_convolution(net, 3, 4 * cnum, 2, 1, relu)
-        # net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
-        # net = gated_convolution(net, 3, 4 * cnum, 1, 1, tf.nn.relu)
-        # # net, offset_flow = contextual_attention(net, net, mask, 3, 1, rate=2)
-        # # net, offset_flow = contextual_attention(net, net, mask, 3, stride=1, rate=1,
-        # #                                         fuse_k=3, softmax_scale=1.0, fuse=True)
-        # net = custom_context_attenion(net, mask)
-        # # net = custom_context_attenion2(net, 4 * cnum)
-        #
-        # net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
-        # net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
-        # pm = net
-        #
-        # # Concatenating regular conv and attention branches
-        # net = tf.concat([net_hallu, pm], axis=3)
-
-        net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
-        net = gated_convolution(net, 3, 4 * cnum, 1, 1, relu)
-
-        net = upsample_x2(net)
-        net = gated_convolution(net, 3, 2 * cnum, 1, 1, lrelu)
-        net = gated_convolution(net, 3, 2 * cnum, 1, 1, lrelu)
-
-        net = upsample_x2(net)
-        net = gated_convolution(net, 3, cnum, 1, 1, lrelu)
-        net = gated_convolution(net, 3, cnum // 2, 1, 1, lrelu)
-
-        net = regular_convolution(net, 3, 3, 1, 1)
+        net = u(net, 128)
+        net = u(net, 64)
+        net = c(net, 3, inst_norm=False, activation=False)
+        # net = tf.nn.tanh(net)
         net = tf.clip_by_value(net, -1., 1.)
         return net
 
@@ -1072,8 +1060,10 @@ def build_generator(params, images, masks, edges, mode):
         images_masks_edges = tf.concat([images_gray, masks, edges * masks], axis=3)
         edges_result = build_coarse_net(images_masks_edges)
 
-        # edges_input = edges_result * (1 - masks) + edges
-        edges_input = edges_result
+        # edges_input = edges_result * (1 - masks) + edges * masks
+        # edges_input = edges_result
+        edges_input = edges
+        edges_input = tf.stop_gradient(edges_input)
 
         # refinement_input_images = edges_result * (1 - masks) + images * masks
         refinement_input = tf.concat([images, masks, edges_input], axis=3)
@@ -1088,11 +1078,10 @@ def build_discriminator(name, input_tensor):
         activation = tf.nn.leaky_relu
         cnum = int(64 * 1.0)
 
-        conv1 = conv2d_spectral_norm(input_tensor, cnum, 5, 1, 'SAME', activation=activation, name='conv1')
-        conv2 = conv2d_spectral_norm(conv1, cnum * 2, 5, 2, 'SAME', activation=activation, name='conv2')
-        conv3 = conv2d_spectral_norm(conv2, cnum * 4, 5, 2, 'SAME', activation=activation, name='conv3')
-        conv4 = conv2d_spectral_norm(conv3, cnum * 4, 5, 2, 'SAME', activation=activation, name='conv4')
-        conv5 = conv2d_spectral_norm(conv4, cnum * 4, 5, 2, 'SAME', activation=activation, name='conv5')
-        conv6 = conv2d_spectral_norm(conv5, cnum * 4, 5, 2, 'SAME', activation=activation, name='conv6')
-        features = [conv1, conv2, conv3, conv4, conv5, conv6]
-        return conv6, features
+        conv1 = conv2d_spectral_norm(input_tensor, cnum, 4, 1, 'SAME', activation=activation, name='conv1')
+        conv2 = conv2d_spectral_norm(conv1, cnum * 2, 4, 2, 'SAME', activation=activation, name='conv2')
+        conv3 = conv2d_spectral_norm(conv2, cnum * 4, 4, 2, 'SAME', activation=activation, name='conv3')
+        conv4 = conv2d_spectral_norm(conv3, cnum * 8, 4, 2, 'SAME', activation=activation, name='conv4')
+        conv5 = conv2d_spectral_norm(conv3, cnum, 4, 2, 'SAME', activation=activation, name='conv5')
+        features = [conv1, conv2, conv3, conv4, conv5]
+        return conv5, features

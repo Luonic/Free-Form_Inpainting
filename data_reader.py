@@ -100,6 +100,7 @@ def parse_images(image_filename, mask_filename, float_type):
     edges = tf.cast(edges, tf.uint8)
     edges = tf.py_func(partial_extract_edges, [edges], [tf.uint8], stateful=True, name='Canny_PyFunc')[0]
     edges = tf.cast(edges, float_type)
+    edges = 1 - edges
     # edges = tf.cast(tf.greater(edges, 127), dtype=float_type)
     # edges *= 0
     edges.set_shape((None, None, 1))
@@ -136,6 +137,8 @@ def input_fn(params, images_path, masks_path, batch_size, shuffle):
         masks_dataset = masks_dataset.shuffle(buffer_size=10)
 
     dataset = tf.data.Dataset.zip((images_dataset, masks_dataset))
+
+    dataset = dataset.repeat(None)
 
     if shuffle:
         dataset.shuffle(buffer_size=512)

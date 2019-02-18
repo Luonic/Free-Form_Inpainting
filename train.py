@@ -7,10 +7,10 @@ from functools import partial
 flags = tf.flags
 FLAGS = flags.FLAGS
 
-flags.DEFINE_integer('batch_size', 1, '')
-flags.DEFINE_string("logs_dir", "train_logs/ec_256_1_no-attention", "")
+flags.DEFINE_integer('batch_size', 8, '')
+flags.DEFINE_string("logs_dir", "train_logs/ec_256_17_separate-learn_batch-8", "")
 flags.DEFINE_string("start_checkpoint", None, "")
-flags.DEFINE_integer("log_steps_n", 2, "")  # 250
+flags.DEFINE_integer("log_steps_n", 1000 // 8, "")  # 250
 
 
 def main(argv):
@@ -57,23 +57,23 @@ def main(argv):
         print("Training...")
         estimator.train(train_input_fn)
 
-        print("Evaluating...")
-        eval_result = estimator.evaluate(eval_input_fn)
-        print("Finished evaluating!")
-        print('psnr: {}'.format(eval_result['psnr']))
-        print('ssim: {}'.format(eval_result['ssim']))
-
-        if eval_result['psnr'] > psnr:
-            psnr = eval_result['psnr']
-            estimator.export_savedmodel(
-                export_dir_base=os.path.join(FLAGS.logs_dir, 'SavedModels'),
-                serving_input_receiver_fn=lambda: model_builder.serving_input_receiver_fn(params['float_type']),
-                strip_default_attrs=True)
-            print('Saved new SavedModel with:')
-            print('psnr: {}'.format(eval_result['psnr']))
-            print('ssim: {}'.format(eval_result['ssim']))
-
-        print()
+        # print("Evaluating...")
+        # eval_result = estimator.evaluate(eval_input_fn)
+        # print("Finished evaluating!")
+        # print('psnr: {}'.format(eval_result['psnr']))
+        # print('ssim: {}'.format(eval_result['ssim']))
+        #
+        # if eval_result['psnr'] > psnr:
+        #     psnr = eval_result['psnr']
+        #     estimator.export_savedmodel(
+        #         export_dir_base=os.path.join(FLAGS.logs_dir, 'SavedModels'),
+        #         serving_input_receiver_fn=lambda: model_builder.serving_input_receiver_fn(params['float_type']),
+        #         strip_default_attrs=True)
+        #     print('Saved new SavedModel with:')
+        #     print('psnr: {}'.format(eval_result['psnr']))
+        #     print('ssim: {}'.format(eval_result['ssim']))
+        #
+        # print()
 
 
 if __name__ == '__main__':
